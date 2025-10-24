@@ -1,9 +1,22 @@
 # PyTorch Lightning on Intel Aurora
 
-Production-ready PyTorch Lightning implementation for Intel Aurora XPUs. Modified codes based on the SwiFT v2 project, which was tested up to 128 nodes (1,536 GPUs) on
+Production-ready PyTorch Lightning implementation for Intel Aurora XPUs. Modified codes based on the SwiFT v2 project, which was tested up to 128 nodes (1,536 GPUs).
 
 **Author**: Jubin Choi (wnqlszoq123@snu.ac.kr), PhD student at Connectome Lab, Seoul National University
 
+---
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Key Aurora Adaptations](#key-aurora-adaptations)
+- **[Strategy Selection Guide](#strategy-selection-guide)** ← **Start here to choose DDP or DeepSpeed**
+  - [Option 1: XPUDeepSpeedStrategy (Recommended for Most Cases)](#option-1-xpudeepspeedstrategy-recommended-for-most-cases)
+  - [Option 2: MPIDDPStrategy (For Smaller Models)](#option-2-mpiddpstrategy-for-smaller-models)
+  - [Strategy Comparison Table](#strategy-comparison-table)
+- [Training Strategies Overview](#training-strategies-overview)
+- [Performance Optimization](#performance-optimization)
+- [Adapting for Your Project](#adapting-for-your-project)
+- [Troubleshooting](#troubleshooting)
 ---
 
 ## Quick Start
@@ -61,12 +74,93 @@ tail -f logs/ptl_ddp_simple_*.txt
 |-----------|-----------------|--------------|
 | Accelerator | `'gpu'` | `'xpu'` |
 | Backend | `'nccl'` | `'xccl'` |
-| Strategy | Built-in DDP | `MPIDDPStrategy|XPUDeepSpeedStrategy` |
+| Strategy | Built-in DDP | `MPIDDPStrategy`, `XPUDeepSpeedStrategy` |
 | Device | `.to('cuda')` | `.to('xpu')` |
 | Precision | `'fp16'` | `'bf16'` (recommended) |
 
-### Code Example
+---
 
+## Strategy Selection Guide
+
+### Option 1: XPUDeepSpeedStrategy (Recommended for large scale training)
+
+**Best for:**
+- Achieving maximum memory efficiency to enable larger models or batch sizes.
+- Models of any size, from small to 100B+ parameters.
+- **Stage 2 is the recommended starting point**, offering an excellent balance of memory savings and performance.
+
+**Code Example:**
+```python
+import torch
+import pytorch_lightning as pl
+from aurora_utils.deepspeed_intel import XPUDeepSpeedStrategy
+from aurora_utils.ddp_intel import MPIEnvironment
+
+# Setup Aurora environment
+env = MPIEnvironment()
+
+# Create DeepSpeed strategy (Stage 1 or 2 is a great default)
+from pytorch_lightning.plugins.precision import DeepSpeedPrecisionPlugin
+strategy = XPUDeepSpeedStrategy(
+    accelerator="xpu",
+    cluster_environment=env,
+    precision_plugin=DeepSpeedPrecisionPlugin(precision='bf16'),
+    process_group_backend='xccl',
+    stage=2,
+    offload_optimizer=True,
+    logging_batch_size_per_gpu="auto"
+)
+
+# Train
+trainer = pl.Trainer(
+    strategy=strategy,
+    devices=12,
+    num_nodes=4,
+    precision='bf16'
+)
+trainer.fit(model, datamodule)
+```
+
+**Command-line usage:**
+- Always test the best options for your project. 
+
+```bash
+NNODES=$(wc -l < $PBS_NODEFILE)
+NRANKS_PER_NODE=12
+NTOTRANKS=$((NNODES * NRANKS_PER_NODE))
+MPI_ARG="-n ${NTOTRANKS} --ppn ${NRANKS_PER_NODE} "
+mpi_run_command="mpiexec ${MPI_ARG} scripts/set_rank_and_redirect_outerr.sh "
+
+# Stage 1: Optimizer state partitioning
+${mpi_run_command} python project/simple_example.py \
+    --strategy deepspeed_stage_1 \
+    --num_nodes ${NNODES} \
+    --devices ${NRANKS_PER_NODE} \
+    --precision bf16
+
+# Stage 2: Optimizer + gradient partitioning (recommended)
+${mpi_run_command} python project/simple_example.py \
+    --strategy deepspeed_stage_2 \
+    --num_nodes ${NNODES} \
+    --devices ${NRANKS_PER_NODE} \
+    --precision bf16
+
+# Stage 3: Full parameter sharding (for very large models)
+${mpi_run_command} python project/simple_example.py \
+    --strategy deepspeed_stage_3 \
+    --num_nodes ${NNODES} \
+    --devices ${NRANKS_PER_NODE} \
+    --precision bf16
+```
+
+### Option 2: MPIDDPStrategy (For Smaller Models)
+
+**Best for:**
+- Smaller models where memory is not a concern.
+- Scenarios where maximum throughput is critical and the model + batch size easily fit in GPU memory.
+- Simpler checkpointing and debugging workflows.
+
+**Code Example:**
 ```python
 import torch
 import pytorch_lightning as pl
@@ -81,7 +175,7 @@ torch.distributed.init_process_group(
     rank=env.global_rank()
 )
 
-# Create strategy
+# Create DDP strategy
 from pytorch_lightning.plugins.precision import MixedPrecisionPlugin
 strategy = MPIDDPStrategy(
     accelerator="xpu",
@@ -102,6 +196,24 @@ trainer = pl.Trainer(
 )
 trainer.fit(model, datamodule)
 ```
+
+**Command-line usage:**
+```bash
+${mpi_run_command} python project/simple_example.py \
+    --strategy ddp \
+    --num_nodes ${NNODES} \
+    --devices ${NRANKS_PER_NODE} \\
+    --precision bf16
+```
+
+### Strategy Comparison Table
+
+| Feature | MPIDDPStrategy | XPUDeepSpeedStrategy |
+|---------|----------------|---------------------|
+| **Speed** | Fast for small models | Slow for small models |
+| **Memory Usage** | Baseline | Reduced (4-16x savings) |
+| **Complexity** | Simple | Moderate |
+| **Checkpointing** | Standard | DeepSpeed format |
 
 ---
 
@@ -124,28 +236,56 @@ pytorch_lightning_aurora_example/
 
 ---
 
-## Training Strategies
+## Training Strategies Overview
 
-### DDP (Distributed Data Parallel)
-**When**: Model fits in GPU memory
-**Memory**: No savings (baseline)
+This project supports two main distributed training strategies for Intel Aurora XPUs. See [Strategy Selection Guide](#strategy-selection-guide) above for detailed code examples.
 
+### 1. MPIDDPStrategy (DDP)
+
+**Quick Start:**
 ```bash
 qsub scripts/submit_ddp_simple.sh
 ```
 
-### DeepSpeed Stage 2
-**When**: Large models, memory-constrained
-**Memory**: optimizer + gradients offloaded
+| Aspect | Details |
+|--------|---------|
+| **Use Case** | Standard models fitting in GPU memory |
+| **Memory** | Baseline (no savings) |
+| **Speed** | Fastest training speed |
+| **Nodes** | 1-32 nodes recommended |
+| **Script** | `scripts/submit_ddp_simple.sh` |
 
+### 2. XPUDeepSpeedStrategy
+
+**Quick Start:**
 ```bash
+# Stage 2 (recommended for the start point)
 qsub scripts/submit_deepspeed_stage2.sh
 ```
 
-### DeepSpeed Stage 3
-**When**: Very large models (100B+ params)
-**Memory**: all parameters distributed (parameters, optimizer, gradients)
+| Stage | Memory Savings | Example Use Case | Nodes |
+|-------|----------------|----------|-------|
+| **Stage 1** | 4x (optimizer partitioned) | Medium models | 2-16 |
+| **Stage 2** | 8x (optimizer + gradients) | Large models | 4-64 |
+| **Stage 3** | 16x (all parameters) | 15B+ params | 8+ |
 
+**DeepSpeed Stage Details:**
+- **Stage 1**: Optimizer states partitioned across GPUs
+- **Stage 2**: Optimizer + gradients partitioned (recommended)
+- **Stage 3**: Full ZeRO - all parameters, gradients, and optimizer states sharded
+
+### How to Choose?
+
+```
+Model fits in memory (< 40GB/tile)? → Use MPIDDPStrategy
+    ├─ Fast training speed needed? → MPIDDPStrategy ✓
+    └─ Standard checkpointing? → MPIDDPStrategy ✓
+
+Model doesn't fit in memory or each data is big ?  → Use XPUDeepSpeedStrategy
+    ├─ Medium model (~3B params)? → DeepSpeed Stage 1 or 2
+    ├─ Large model (3-15B params)? → DeepSpeed Stage 2 or 3
+    └─ Very large model (15B+ params)? → DeepSpeed Stage 3 + CPU Offload
+```
 ---
 
 ## Performance Optimization
